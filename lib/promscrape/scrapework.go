@@ -283,6 +283,8 @@ func (sw *scrapeWork) storeLastScrape(lastScrapeStr string) {
 
 func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) {
 	var randSleep uint64
+	var alignedTimestamp int64
+	now := time.Now().UnixNano()
 	scrapeInterval := sw.Config.ScrapeInterval
 	scrapeAlignInterval := sw.Config.ScrapeAlignInterval
 	scrapeOffset := sw.Config.ScrapeOffset
@@ -314,16 +316,25 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) 
 		}
 		randSleep -= sleepOffset
 	} else {
-		d := uint64(scrapeAlignInterval)
-		randSleep = d - uint64(time.Now().UnixNano())%d
-		if scrapeOffset > 0 {
-			randSleep += uint64(scrapeOffset)
-		}
-		randSleep %= uint64(scrapeInterval)
+		alignedTimestamp, randSleep = firstAlignedScrape(now, scrapeAlignInterval, scrapeOffset, scrapeInterval)
 	}
 	timer := timerpool.Get(time.Duration(randSleep))
 	var timestamp int64
 	var ticker *time.Ticker
+	realign := false
+	tick := func(t int64) {
+		ts, skip := scrapeTimestampAt(t, timestamp, scrapeInterval.Milliseconds(), scrapeAlignInterval > 0)
+		if skip {
+			// Skip the scrape and fire the ticker at the next grid point. This puts
+			// the ticker back on the grid, so later scrapes run close to their timestamps.
+			ticker.Reset(time.Duration(ts-t) * time.Millisecond)
+			timestamp = ts - scrapeInterval.Milliseconds()
+			realign = true
+			return
+		}
+		timestamp = ts
+		sw.scrapeAndLogError(timestamp, t)
+	}
 	select {
 	case <-stopCh:
 		timerpool.Put(timer)
@@ -331,8 +342,14 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) 
 	case <-timer.C:
 		timerpool.Put(timer)
 		ticker = time.NewTicker(scrapeInterval)
-		timestamp = time.Now().UnixMilli()
-		sw.scrapeAndLogError(timestamp, timestamp)
+		t := time.Now().UnixMilli()
+		timestamp = t
+		if scrapeAlignInterval > 0 {
+			// The planned time, not the wake-up time. Replicas that scrape the same
+			// target write the same timestamp, so deduplication can keep a scraped value.
+			timestamp = alignedTimestamp
+		}
+		tick(t)
 	}
 	defer ticker.Stop()
 	for {
@@ -370,11 +387,16 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) 
 			return
 		case tt := <-ticker.C:
 			t := tt.UnixMilli()
-			if d := math.Abs(float64(t - timestamp)); d > 0 && d/float64(scrapeInterval.Milliseconds()) > 0.1 {
-				// Too big jitter. Adjust timestamp
-				timestamp = t
+			if scrapeAlignInterval > 0 {
+				// A tick received late still carries the time it was due, which can be a grid point.
+				t = time.Now().UnixMilli()
 			}
-			sw.scrapeAndLogError(timestamp, t)
+			if realign {
+				// The ticker fired at the grid point. Restore the scrape interval.
+				ticker.Reset(scrapeInterval)
+				realign = false
+			}
+			tick(t)
 		}
 	}
 }
@@ -402,6 +424,42 @@ func (sw *scrapeWork) logParseError(s string) {
 	logger.ErrorfSkipframes(1, "error when scraping %q from job %q with labels %s: %s; "+
 		"see how to limit or disable these errors at https://docs.victoriametrics.com/victoriametrics/vmagent/#troubleshooting",
 		sw.Config.ScrapeURL, sw.Config.Job(), sw.Config.Labels.String(), s)
+}
+
+// firstAlignedScrape returns the time of the first scrape in Unix milliseconds,
+// and the nanoseconds to wait for it. now is Unix time in nanoseconds.
+// If now is a grid point, the first scrape is now. Otherwise it is the next grid point.
+// Replicas that start between the same two grid points get the same timestamp.
+func firstAlignedScrape(now int64, alignInterval, offset, scrapeInterval time.Duration) (timestamp int64, sleep uint64) {
+	d := uint64(alignInterval)
+	sleep = d - uint64(now)%d
+	if offset > 0 {
+		sleep += uint64(offset)
+	}
+	sleep %= uint64(scrapeInterval)
+	timestamp = (now + int64(sleep)) / 1e6
+	return timestamp, sleep
+}
+
+// scrapeTimestampAt returns the timestamp for a scrape that starts at clock time now.
+// planned is the planned scrape time, according to the interval. Both are Unix milliseconds.
+// If now is at most 10% of interval away from planned, it returns planned.
+// Otherwise, a scrape that is not aligned returns now.
+// An aligned scrape returns the last planned time no later than now, according to the interval,
+// if now is at most 10% of interval after it. Otherwise, it returns the next planned time,
+// and skip is true, so the scrape should be skipped.
+func scrapeTimestampAt(now, planned, interval int64, aligned bool) (ts int64, skip bool) {
+	if d := math.Abs(float64(now - planned)); d == 0 || d/float64(interval) <= 0.1 {
+		return planned, false
+	}
+	if !aligned {
+		return now, false
+	}
+	prev := planned + int64(math.Floor(float64(now-planned)/float64(interval)))*interval
+	if now-prev <= interval/10 {
+		return prev, false
+	}
+	return prev + interval, true
 }
 
 func (sw *scrapeWork) scrapeAndLogError(scrapeTimestamp, realTimestamp int64) {
@@ -514,6 +572,11 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 		// Process response body from scrape target at once.
 		// This case should work more optimally than stream parse for common case when scrape target exposes
 		// up to a few thousand metrics.
+		if sw.Config.ScrapeAlignInterval > 0 || sw.Config.ScrapeOffset > 0 {
+			// Stale markers of an aligned scrape get its timestamp, so they tie with the samples a replica scraped
+			// for the same grid point, and deduplication prefers a scraped value over them, e.g. after this scrape failed.
+			realTimestamp = scrapeTimestamp
+		}
 		err = sw.processDataOneShot(scrapeTimestamp, realTimestamp, body.B, scrapeDurationSeconds, err)
 	}
 

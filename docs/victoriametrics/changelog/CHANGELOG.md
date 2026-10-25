@@ -27,6 +27,7 @@ See also [LTS releases](https://docs.victoriametrics.com/victoriametrics/lts-rel
 ## tip
 
 * BUGFIX: [stream aggregation](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/): prevent spikes in `rate_sum` and `rate_avg` outputs with `enable_windows: true` when out-of-order samples arrive around the aggregation window boundary. Previously, an out-of-order sample could be treated as a counter reset, causing large spike in the result. See [#11810](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/11810).
+* BUGFIX: [vmagent](https://docs.victoriametrics.com/victoriametrics/vmagent/): use the aligned scrape time as the sample timestamp for targets with `scrape_align_interval` or `scrape_offset`, and use it for staleness markers when the scrape request fails. Previously, `vmagent` instances scraping the same target in [cluster mode](https://docs.victoriametrics.com/victoriametrics/vmagent/#scraping-big-number-of-targets) with `-promscrape.cluster.replicationFactor` could store samples with timestamps a few milliseconds apart, so [deduplication](https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#deduplication) could keep `up=0` and staleness markers from the instance that failed the scrape instead of the values from the instance that succeeded. See [#10196](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/10196).
 
 ## [v1.155.0](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/tag/v1.155.0)
 
